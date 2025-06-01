@@ -1,14 +1,28 @@
 [profile.default]
+# source folders
+src = "src"
+out = "out"
+libs = ["lib"]
+
+# compiler
+solc_version = "0.8.24"   # matches v4-core at time of writing
 optimizer = true
-optimizer_runs = 200
+optimizer_runs = 10000
 via_ir = true
+
+# Cancun features (e.g. transient storage)
+evm_version = "cancun"
+
+# dependency resolution
 auto_detect_remappings = false
 remappings = [
-    "@uniswap/v4-core/=lib/v4-core/",
-    "@uniswap/v4-periphery/=lib/v4-periphery/",
+    # --- v4 core & periphery (monorepo) ---
+    "@uniswap/v4-core/=lib/v4-core/packages/v4-core/",
+    "@uniswap/v4-core/src/=lib/v4-core/packages/v4-core/src/",
+    "@uniswap/v4-periphery/=lib/v4-periphery/packages/v4-periphery/",
+    "@uniswap/v4-periphery/src/=lib/v4-periphery/packages/v4-periphery/src/",
+
+    # --- other libs ---
     "forge-std/=lib/forge-std/src/",
     "solmate/=lib/v4-core/lib/solmate/src/"
 ]
-
-[rpc_endpoints]
-# mainnet = "https://eth.llamarpc.com"
