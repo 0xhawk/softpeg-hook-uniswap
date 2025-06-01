@@ -16,7 +16,6 @@ evm_version = "cancun"
 # dependency resolution
 auto_detect_remappings = false
 remappings = [
-    # --- v4 core & periphery (monorepo) ---
     "@uniswap/v4-core/=lib/v4-core/packages/v4-core/",
     "@uniswap/v4-core/src/=lib/v4-core/packages/v4-core/src/",
     "@uniswap/v4-periphery/=lib/v4-periphery/packages/v4-periphery/",
