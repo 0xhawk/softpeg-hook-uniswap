@@ -8,6 +8,8 @@ import {BaseHook} from "@uniswap/v4-periphery/src/utils/BaseHook.sol";
 import {Hooks}    from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {IStateView} from "@uniswap/v4-periphery/src/interfaces/IStateView.sol";
 
 interface IOracle {
     function price() external view returns (uint256);
@@ -21,19 +23,24 @@ interface IPSM {
 error PegOutOfRange();
 
 contract SoftPegHook is BaseHook {
-    IOracle      public immutable oracle;
-    IPSM   public immutable psm;  
+    IOracle public immutable oracle;
+    IPSM   public immutable psm;
+    PoolKey public poolKey; // target pool we guard
+    IStateView public stateView; // for reading pool state
 
-    uint256 public constant MAX_BAND_BPS  = 30;
-    uint256 public constant HARD_CAP_BPS = 100;
-    uint24  private constant OVERRIDE_FLAG = 0x400000; // Uniswap v4 custom‑fee flag
+    uint256 public constant MAX_BAND_BPS  = 30;   // ±0.30 %
+    uint256 public constant HARD_CAP_BPS = 100;   // ±1.00 %
+    uint24  private constant OVERRIDE_FLAG = 0x400000; // custom‑fee flag
+
     /*---------------- Testing aids (mock overrides) --------------*/
     uint256 public mockPoolPrice;               // if non‑zero, overrides pool price
     function setMockPoolPrice(uint256 p) external { mockPoolPrice = p; }
 
-    constructor(IPoolManager _pm, IOracle _oracle, IPSM _psm) BaseHook(_pm) {
-        oracle = _oracle;
-        psm    = _psm;
+    constructor(IPoolManager _pm, PoolKey memory _key, IOracle _oracle, IPSM _psm, IStateView _stateView) BaseHook(_pm) {
+        poolKey = _key;
+        oracle  = _oracle;
+        psm     = _psm;
+        stateView = _stateView;
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory perms) {
@@ -41,43 +48,28 @@ contract SoftPegHook is BaseHook {
         perms.afterSwap  = true;
     }
 
-    function _beforeSwap(
-        address /*sender*/,
-        PoolKey calldata /*key*/,
-        SwapParams calldata /*params*/,
-        bytes calldata /*hookData*/
-    )
-        internal
-        view
-        override
+    /* ------------- beforeSwap ------------- */
+    function _beforeSwap(address, PoolKey calldata, SwapParams calldata, bytes calldata)
+        internal view override
         returns (bytes4, BeforeSwapDelta, uint24 fee)
     {
-        // Use mock price if set (tests) otherwise fall back to oracle price
-        uint256 poolP = mockPoolPrice > 0 ? mockPoolPrice : oracle.price();
-        fee = feeOverride(poolP);
+        uint256 postPrice = _currentPoolPrice(); // TODO simulate post‑swap
+        fee = feeOverride(postPrice);
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
     }
 
-    function afterSwap(
-        address,
-        PoolKey calldata,
-        SwapParams calldata,
-        BalanceDelta,
-        bytes calldata
-    ) external override returns (bytes4, int128) {
-        uint256 poolP  = _currentPoolPrice();
+    /* ------------- afterSwap -------------- */
+    function _afterSwap(address, PoolKey calldata, SwapParams calldata, BalanceDelta, bytes calldata)
+        internal override
+        returns (bytes4, int128)
+    {
+        uint256 price = _currentPoolPrice();
         uint256 target = oracle.price();
-        uint256 diff   = poolP > target ? poolP - target : target - poolP;
-        uint256 bps    = diff * 10_000 / target;
-
+        uint256 diff = price > target ? price - target : target - price;
+        uint256 bps  = diff * 10_000 / target;
         if (bps > MAX_BAND_BPS && bps <= HARD_CAP_BPS) {
-            if (poolP > target) {
-                // price high → mint SPT & sell into pool
-                psm.sellSPT(target, poolP);
-            } else {
-                // price low → buy & burn SPT
-                psm.buySPT(target, poolP);
-            }
+            if (price > target) psm.sellSPT(target, price);
+            else psm.buySPT(target, price);
         }
         return (BaseHook.afterSwap.selector, 0);
     }
@@ -88,23 +80,31 @@ contract SoftPegHook is BaseHook {
         return diff * 10_000 <= target * MAX_BAND_BPS;
     }
 
-    function feeOverride(uint256 poolPrice) public view returns (uint24) {
-        (, uint256 diff) = _diffBps(poolPrice);
-        if (diff > HARD_CAP_BPS) revert PegOutOfRange();
-        if (diff <= MAX_BAND_BPS) return 0;                 // inside band
-        return uint24(500) | OVERRIDE_FLAG;                 // 5 % fee + flag
-    }
-
-    function _diffBps(uint256 poolPrice) internal view returns (uint256 target, uint256 bps) {
-        target = oracle.price();
-        uint256 diff = target > poolPrice ? target - poolPrice : poolPrice - target;
-        bps = diff * 10_000 / target;
-    }
-
+    /* ---------- helpers ---------- */
     function _currentPoolPrice() internal view returns (uint256) {
-        return mockPoolPrice != 0 ? mockPoolPrice : oracle.price();
+        if (mockPoolPrice != 0) return mockPoolPrice;
+        (uint160 sqrtP,,,) = stateView.getSlot0(PoolIdLibrary.toId(poolKey));
+        return price1e18FromSqrt(sqrtP);
     }
 
-    // Override for testing: disables hook address validation
+    function price1e18FromSqrt(uint160 sqrtP) public pure returns (uint256) {
+        uint256 n = uint256(sqrtP) * uint256(sqrtP);
+        return (n * 1e18) >> 192;
+    }
+
+    function feeOverride(uint256 price) public view returns (uint24) {
+        (, uint256 diff) = _diffBps(price);
+        if (diff > HARD_CAP_BPS) revert PegOutOfRange();
+        if (diff <= MAX_BAND_BPS) return 0;
+        return uint24(500) | OVERRIDE_FLAG;
+    }
+
+    function _diffBps(uint256 price) internal view returns (uint256 target,uint256 bps){
+        target = oracle.price();
+        uint256 d = target > price ? target - price : price - target;
+        bps = d * 10_000 / target;
+    }
+
+    /* disable hook validation in tests */
     function validateHookAddress(BaseHook) internal pure override {}
 }
