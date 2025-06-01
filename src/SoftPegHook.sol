@@ -6,62 +6,80 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {BaseHook} from "@uniswap/v4-periphery/src/utils/BaseHook.sol";
 import {Hooks}    from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 
 interface IOracle {
     function price() external view returns (uint256);
 }
 
+interface IPSM {
+    function sellSPT(uint256 target, uint256 price) external;
+    function buySPT(uint256 target, uint256 price) external;
+}
+
 error PegOutOfRange();
 
 contract SoftPegHook is BaseHook {
-    IPoolManager public immutable poolManager;
     IOracle      public immutable oracle;
+    IPSM   public immutable psm;  
 
-    // soft band ±0.30 % = 30 bps
     uint256 public constant MAX_BAND_BPS  = 30;
-    // hard cap  ±1.00 %  = 100 bps ⇒ revert
     uint256 public constant HARD_CAP_BPS = 100;
+    uint24  private constant OVERRIDE_FLAG = 0x400000; // Uniswap v4 custom‑fee flag
+    /*---------------- Testing aids (mock overrides) --------------*/
+    uint256 public mockPoolPrice;               // if non‑zero, overrides pool price
+    function setMockPoolPrice(uint256 p) external { mockPoolPrice = p; }
 
-    // Uniswap v4 fee‑override flag (0x400000) to indicate custom fee
-    uint24 private constant OVERRIDE_FLAG = 0x400000;
-
-    constructor(IPoolManager _poolManager, IOracle _oracle)
-        BaseHook(_poolManager)
-    {
+    constructor(IPoolManager _pm, IOracle _oracle, IPSM _psm) BaseHook(_pm) {
         oracle = _oracle;
+        psm    = _psm;
     }
 
-    function getHookPermissions() public pure override returns (uint8) {
-        // we only implement beforeSwap for now
-        return Hooks.BEFORE_SWAP_FLAG;
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory perms) {
+        perms.beforeSwap = true;
+        perms.afterSwap  = true;
     }
 
-    function beforeSwap(
+    function _beforeSwap(
         address /*sender*/,
         PoolKey calldata /*key*/,
-        IPoolManager.SwapParams calldata /*params*/,
+        SwapParams calldata /*params*/,
         bytes calldata /*hookData*/
     )
-        external
+        internal
         view
         override
         returns (bytes4, BeforeSwapDelta, uint24 fee)
     {
         // Use mock price if set (tests) otherwise fall back to oracle price
-        uint256 poolP = mockPoolPrice != 0 ? mockPoolPrice : oracle.price();
-        fee = _feeOverride(poolP);
-        return (SoftPegHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
+        uint256 poolP = mockPoolPrice > 0 ? mockPoolPrice : oracle.price();
+        fee = feeOverride(poolP);
+        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);
     }
 
-    // afterSwap not used yet but must exist – return default selector
     function afterSwap(
         address,
         PoolKey calldata,
-        IPoolManager.SwapParams calldata,
-        bytes calldata,
-        int128
-    ) external pure override returns (bytes4) {
-        return SoftPegHook.afterSwap.selector;
+        SwapParams calldata,
+        BalanceDelta,
+        bytes calldata
+    ) external override returns (bytes4, int128) {
+        uint256 poolP  = _currentPoolPrice();
+        uint256 target = oracle.price();
+        uint256 diff   = poolP > target ? poolP - target : target - poolP;
+        uint256 bps    = diff * 10_000 / target;
+
+        if (bps > MAX_BAND_BPS && bps <= HARD_CAP_BPS) {
+            if (poolP > target) {
+                // price high → mint SPT & sell into pool
+                psm.sellSPT(target, poolP);
+            } else {
+                // price low → buy & burn SPT
+                psm.buySPT(target, poolP);
+            }
+        }
+        return (BaseHook.afterSwap.selector, 0);
     }
 
     function isWithinBand(uint256 poolPrice) public view returns (bool) {
@@ -71,14 +89,10 @@ contract SoftPegHook is BaseHook {
     }
 
     function feeOverride(uint256 poolPrice) public view returns (uint24) {
-        (uint256 target, uint256 diffBps) = _diffBps(poolPrice);
-
-        if (diffBps > HARD_CAP_BPS) revert PegOutOfRange();
-        if (diffBps <= MAX_BAND_BPS) return 0; // inside band
-
-        // between 0.30 % and 1.00 % → 5 % fee, set override flag
-        uint24 feeBps = 500; // 500 bps = 5 %
-        return feeBps | OVERRIDE_FLAG;
+        (, uint256 diff) = _diffBps(poolPrice);
+        if (diff > HARD_CAP_BPS) revert PegOutOfRange();
+        if (diff <= MAX_BAND_BPS) return 0;                 // inside band
+        return uint24(500) | OVERRIDE_FLAG;                 // 5 % fee + flag
     }
 
     function _diffBps(uint256 poolPrice) internal view returns (uint256 target, uint256 bps) {
@@ -86,4 +100,11 @@ contract SoftPegHook is BaseHook {
         uint256 diff = target > poolPrice ? target - poolPrice : poolPrice - target;
         bps = diff * 10_000 / target;
     }
+
+    function _currentPoolPrice() internal view returns (uint256) {
+        return mockPoolPrice != 0 ? mockPoolPrice : oracle.price();
+    }
+
+    // Override for testing: disables hook address validation
+    function validateHookAddress(BaseHook) internal pure override {}
 }

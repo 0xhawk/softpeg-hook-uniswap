@@ -16,10 +16,10 @@ evm_version = "cancun"
 # dependency resolution
 auto_detect_remappings = false
 remappings = [
-    "@uniswap/v4-core/=lib/v4-core/packages/v4-core/",
-    "@uniswap/v4-core/src/=lib/v4-core/packages/v4-core/src/",
-    "@uniswap/v4-periphery/=lib/v4-periphery/packages/v4-periphery/",
-    "@uniswap/v4-periphery/src/=lib/v4-periphery/packages/v4-periphery/src/",
+    "@uniswap/v4-core/src/=lib/v4-core/src/",
+    "@uniswap/v4-core/contracts/=lib/v4-core/src/",
+    "@uniswap/v4-periphery/src/=lib/v4-periphery/src/",
+    "@uniswap/v4-periphery/contracts/=lib/v4-periphery/src/",
 
     # --- other libs ---
     "forge-std/=lib/forge-std/src/",
